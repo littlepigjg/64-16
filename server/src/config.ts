@@ -1,4 +1,5 @@
 import path from 'path';
+import type { CircuitBreakerConfig } from './modules/circuit-breaker';
 
 export const config = {
   port: parseInt(process.env.PORT || '4873', 10),
@@ -21,6 +22,15 @@ export const config = {
     requireAuth: process.env.REQUIRE_AUTH === 'true',
     adminToken: process.env.ADMIN_TOKEN || 'admin-token-change-me',
   },
+  circuitBreaker: {
+    failureThreshold: parseInt(process.env.CB_FAILURE_THRESHOLD || '5', 10),
+    responseTimeThreshold: parseInt(process.env.CB_RESPONSE_TIME_THRESHOLD || '5000', 10),
+    slowResponseThreshold: parseInt(process.env.CB_SLOW_RESPONSE_THRESHOLD || '2000', 10),
+    openStateDuration: parseInt(process.env.CB_OPEN_DURATION || '30000', 10),
+    halfOpenMaxRequests: parseInt(process.env.CB_HALF_OPEN_MAX || '3', 10),
+    rateLimitPerSecond: parseInt(process.env.CB_RATE_LIMIT || '100', 10),
+    windowSize: parseInt(process.env.CB_WINDOW_SIZE || '60000', 10),
+  } as CircuitBreakerConfig,
 };
 
 export type AppConfig = typeof config;

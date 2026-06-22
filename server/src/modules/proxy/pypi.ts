@@ -5,6 +5,7 @@ import { getCacheStorage } from '../cache';
 import type { PackageVersion } from '../../types';
 import {
   makeRequest,
+  UpstreamUnavailableError,
   parsePypiSimpleIndex,
   renderPypiSimpleIndex,
   parsePypiPackageLinks,
@@ -42,7 +43,10 @@ pypiRouter.get('/simple/', async (_req: Request, res: Response, next: NextFuncti
       } else {
         upstreamFailed = true;
       }
-    } catch (_err) {
+    } catch (err) {
+      if (err instanceof UpstreamUnavailableError) {
+        throw err;
+      }
       upstreamFailed = true;
     }
 
@@ -120,7 +124,10 @@ pypiRouter.get(/^\/simple\/(.+)\/$/, async (req: Request, res: Response, next: N
       } else {
         upstreamFailed = true;
       }
-    } catch (_err) {
+    } catch (err) {
+      if (err instanceof UpstreamUnavailableError) {
+        throw err;
+      }
       upstreamFailed = true;
       if (localFiles.length === 0) {
         res.status(502).send(

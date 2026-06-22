@@ -5,6 +5,7 @@ import type {
   StorageTrend,
   CachePolicy,
   HealthInfo,
+  UpstreamHealth,
   RegistryType,
   PackageSource,
 } from './types';
@@ -89,4 +90,13 @@ export const api = {
     request<{ success: boolean; timestamp: number }>('/cache/snapshot', {
       method: 'POST',
     }),
+
+  getUpstreamHealth: () =>
+    request<{ upstreams: UpstreamHealth[] }>('/upstream-health'),
+
+  resetUpstreamHealth: (name: string) =>
+    request<{ success: boolean; name: string; state: string }>(
+      `/upstream-health/${encodeURIComponent(name)}/reset`,
+      { method: 'POST' }
+    ),
 };

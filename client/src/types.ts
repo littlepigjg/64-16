@@ -1,5 +1,25 @@
 export type RegistryType = 'npm' | 'pypi';
 export type PackageSource = 'cache' | 'private' | 'upstream';
+export type CircuitBreakerState = 'closed' | 'open' | 'half-open';
+export type UpstreamStatus = 'healthy' | 'degraded' | 'unhealthy';
+
+export interface UpstreamHealth {
+  name: string;
+  url: string;
+  state: CircuitBreakerState;
+  status: UpstreamStatus;
+  totalRequests: number;
+  successCount: number;
+  failureCount: number;
+  slowResponseCount: number;
+  consecutiveFailures: number;
+  avgResponseTime: number;
+  lastFailureTime: number | null;
+  lastSuccessTime: number | null;
+  openUntil: number | null;
+  rateLimitRemaining: number;
+  errorRate: number;
+}
 
 export interface PackageVersion {
   version: string;

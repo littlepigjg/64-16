@@ -4,7 +4,7 @@ import { getMetadataIndex } from '../metadata';
 import { getCacheStorage } from '../cache';
 import { parseNpmPackageName, sanitizePath } from '../../utils';
 import { isPrivateScope } from '../private-pkg';
-import { makeRequest } from './utils';
+import { makeRequest, UpstreamUnavailableError } from './utils';
 import type { PackageVersion } from '../../types';
 
 const npmRouter = Router();
@@ -23,13 +23,17 @@ npmRouter.get('/-/ping', (_req: Request, res: Response) => {
   res.json({});
 });
 
-npmRouter.get('/-/v1/search', async (req: Request, res: Response) => {
+npmRouter.get('/-/v1/search', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const query = req.url.split('?')[1] || '';
     const response = await makeRequest(`${config.npm.upstream}/-/v1/search?${query}`);
     res.status(response.statusCode);
     res.json(JSON.parse(response.body.toString()));
-  } catch (_err) {
+  } catch (err) {
+    if (err instanceof UpstreamUnavailableError) {
+      next(err);
+      return;
+    }
     res.status(502).json({ error: 'Upstream request failed' });
   }
 });

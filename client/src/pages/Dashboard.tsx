@@ -9,6 +9,11 @@ import {
   TrendingDown,
   Loader2,
   RefreshCw,
+  AlertTriangle,
+  CheckCircle,
+  XCircle,
+  Clock,
+  RefreshCw as RefreshIcon,
 } from 'lucide-react';
 import {
   AreaChart,
@@ -22,20 +27,26 @@ import {
   Bar,
 } from 'recharts';
 import { api } from '../api';
-import type { CacheStats, StorageTrend } from '../types';
+import type { CacheStats, StorageTrend, UpstreamHealth, UpstreamStatus } from '../types';
 import { formatSize, formatNumber } from '../utils';
 
 export default function Dashboard() {
   const [stats, setStats] = useState<CacheStats | null>(null);
   const [trend, setTrend] = useState<StorageTrend[]>([]);
+  const [upstreamHealth, setUpstreamHealth] = useState<UpstreamHealth[]>([]);
   const [loading, setLoading] = useState(true);
 
   const loadData = async () => {
     setLoading(true);
     try {
-      const [s, t] = await Promise.all([api.getStats(), api.getTrend(30)]);
+      const [s, t, uh] = await Promise.all([
+        api.getStats(),
+        api.getTrend(30),
+        api.getUpstreamHealth(),
+      ]);
       setStats(s);
       setTrend(t);
+      setUpstreamHealth(uh.upstreams);
     } finally {
       setLoading(false);
     }
@@ -43,7 +54,53 @@ export default function Dashboard() {
 
   useEffect(() => {
     loadData();
+    const interval = setInterval(loadData, 5000);
+    return () => clearInterval(interval);
   }, []);
+
+  const handleResetCircuitBreaker = async (name: string) => {
+    try {
+      await api.resetUpstreamHealth(name);
+      await loadData();
+    } catch (err) {
+      console.error('Failed to reset circuit breaker:', err);
+    }
+  };
+
+  const getStatusIcon = (status: UpstreamStatus) => {
+    switch (status) {
+      case 'healthy':
+        return <CheckCircle className="text-emerald-500" size={20} />;
+      case 'degraded':
+        return <Clock className="text-yellow-500" size={20} />;
+      case 'unhealthy':
+        return <XCircle className="text-red-500" size={20} />;
+    }
+  };
+
+  const getStatusColor = (status: UpstreamStatus) => {
+    switch (status) {
+      case 'healthy':
+        return 'bg-emerald-100 text-emerald-700';
+      case 'degraded':
+        return 'bg-yellow-100 text-yellow-700';
+      case 'unhealthy':
+        return 'bg-red-100 text-red-700';
+    }
+  };
+
+  const getStatusText = (status: UpstreamStatus) => {
+    switch (status) {
+      case 'healthy':
+        return '正常';
+      case 'degraded':
+        return '降级';
+      case 'unhealthy':
+        return '不可用';
+    }
+  };
+
+  const hasUnhealthyUpstream = upstreamHealth.some(u => u.status === 'unhealthy' || u.status === 'degraded');
 
   if (loading) {
     return (
@@ -126,6 +183,98 @@ export default function Dashboard() {
           刷新数据
         </button>
       </div>
+
+      {hasUnhealthyUpstream && (
+        <div className="bg-red-50 border border-red-200 rounded-lg p-4 flex items-start gap-3">
+          <AlertTriangle className="text-red-500 flex-shrink-0 mt-0.5" size={20} />
+          <div className="flex-1">
+            <h3 className="font-semibold text-red-800">上游源连接警告</h3>
+            <p className="text-sm text-red-700 mt-1">
+              检测到部分上游源出现故障或响应缓慢，系统已自动启动熔断保护。
+              相关请求将暂时被拒绝，直到上游源恢复正常。
+            </p>
+          </div>
+        </div>
+      )}
+
+      {upstreamHealth.length > 0 && (
+        <div className="card p-6">
+          <h2 className="text-lg font-semibold text-slate-800 mb-4">上游源健康状态</h2>
+          <div className="space-y-4">
+            {upstreamHealth.map((upstream) => (
+              <div
+                key={upstream.name}
+                className={`p-4 rounded-lg border ${
+                  upstream.status === 'unhealthy'
+                    ? 'bg-red-50 border-red-200'
+                    : upstream.status === 'degraded'
+                    ? 'bg-yellow-50 border-yellow-200'
+                    : 'bg-slate-50 border-slate-200'
+                }`}
+              >
+                <div className="flex items-center justify-between mb-3">
+                  <div className="flex items-center gap-3">
+                    {getStatusIcon(upstream.status)}
+                    <div>
+                      <div className="font-medium text-slate-800">
+                        {upstream.name.toUpperCase()} 上游
+                      </div>
+                      <div className="text-xs text-slate-500 truncate max-w-md">
+                        {upstream.url}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <span className={`px-2 py-1 rounded-full text-xs font-medium ${getStatusColor(upstream.status)}`}>
+                      {getStatusText(upstream.status)}
+                    </span>
+                    {upstream.status !== 'healthy' && (
+                      <button
+                        className="btn btn-secondary text-xs py-1 px-3"
+                        onClick={() => handleResetCircuitBreaker(upstream.name)}
+                        title="手动重置熔断器"
+                      >
+                        <RefreshIcon size={14} />
+                        重置
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+                  <div>
+                    <span className="text-slate-500">总请求数</span>
+                    <div className="font-medium text-slate-800">{formatNumber(upstream.totalRequests)}</div>
+                  </div>
+                  <div>
+                    <span className="text-slate-500">成功率</span>
+                    <div className="font-medium text-slate-800">
+                      {upstream.totalRequests > 0
+                        ? (((upstream.successCount / upstream.totalRequests) * 100).toFixed(1) + '%')
+                        : 'N/A'}
+                    </div>
+                  </div>
+                  <div>
+                    <span className="text-slate-500">平均响应</span>
+                    <div className="font-medium text-slate-800">{upstream.avgResponseTime}ms</div>
+                  </div>
+                  <div>
+                    <span className="text-slate-500">连续失败</span>
+                    <div className={`font-medium ${upstream.consecutiveFailures > 0 ? 'text-red-600' : 'text-slate-800'}`}>
+                      {upstream.consecutiveFailures} 次
+                    </div>
+                  </div>
+                </div>
+                {upstream.openUntil && upstream.status === 'unhealthy' && (
+                  <div className="mt-3 text-sm text-red-600">
+                    <AlertTriangle size={14} className="inline mr-1" />
+                    熔断器已打开，将在 {Math.ceil((upstream.openUntil - Date.now()) / 1000)} 秒后尝试恢复
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
         {statCards.map((card, i) => {

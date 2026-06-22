@@ -1,11 +1,52 @@
 import http from 'http';
 import https from 'https';
 import { URL } from 'url';
+import { getCircuitBreaker, CircuitBreaker } from '../circuit-breaker';
+import { config } from '../../config';
 
 export interface UpstreamResponse {
   statusCode: number;
   headers: Record<string, string>;
   body: Buffer;
+}
+
+export class UpstreamUnavailableError extends Error {
+  public readonly code = 'UPSTREAM_UNAVAILABLE';
+  public readonly upstreamName: string;
+  public readonly upstreamUrl: string;
+  public readonly retryAfter: number | null;
+
+  constructor(message: string, upstreamName: string, upstreamUrl: string, retryAfter: number | null = null) {
+    super(message);
+    this.name = 'UpstreamUnavailableError';
+    this.upstreamName = upstreamName;
+    this.upstreamUrl = upstreamUrl;
+    this.retryAfter = retryAfter;
+  }
+}
+
+function getUpstreamName(urlStr: string): string {
+  if (urlStr.includes('registry.npmjs.org') || urlStr.includes(config.npm.upstream)) {
+    return 'npm';
+  }
+  if (urlStr.includes('pypi.org') || urlStr.includes(config.pypi.upstream) || urlStr.includes(config.pypi.simpleUpstream)) {
+    return 'pypi';
+  }
+  if (urlStr.includes('files.pythonhosted.org')) {
+    return 'pypi-files';
+  }
+  return urlStr;
+}
+
+function getUpstreamBaseUrl(urlStr: string): string {
+  const url = new URL(urlStr);
+  return `${url.protocol}//${url.host}${url.port ? `:${url.port}` : ''}`;
+}
+
+function getCircuitBreakerForUrl(urlStr: string): CircuitBreaker {
+  const name = getUpstreamName(urlStr);
+  const baseUrl = getUpstreamBaseUrl(urlStr);
+  return getCircuitBreaker(name, baseUrl, config.circuitBreaker);
 }
 
 export function makeRequest(
@@ -18,6 +59,23 @@ export function makeRequest(
   } = {}
 ): Promise<UpstreamResponse> {
   const timeoutMs = options.timeout || 30000;
+  const cb = getCircuitBreakerForUrl(urlStr);
+
+  const proceed = cb.canProceed();
+  if (!proceed.allowed) {
+    const health = cb.getHealth();
+    const retryAfter = health.openUntil ? Math.ceil((health.openUntil - Date.now()) / 1000) : null;
+    return Promise.reject(
+      new UpstreamUnavailableError(
+        proceed.reason || `Upstream '${cb.getName()}' is temporarily unavailable`,
+        cb.getName(),
+        cb.getUrl(),
+        retryAfter
+      )
+    );
+  }
+
+  const startTime = Date.now();
 
   const reqPromise = new Promise<UpstreamResponse>((resolve, reject) => {
     const url = new URL(urlStr);
@@ -40,8 +98,17 @@ export function makeRequest(
         const chunks: Buffer[] = [];
         res.on('data', (chunk) => chunks.push(chunk));
         res.on('end', () => {
+          const responseTime = Date.now() - startTime;
+          const statusCode = res.statusCode || 500;
+
+          if (statusCode >= 200 && statusCode < 500) {
+            cb.recordSuccess(responseTime);
+          } else {
+            cb.recordFailure(responseTime);
+          }
+
           resolve({
-            statusCode: res.statusCode || 500,
+            statusCode,
             headers: res.headers as Record<string, string>,
             body: Buffer.concat(chunks),
           });
@@ -49,8 +116,15 @@ export function makeRequest(
       }
     );
 
-    req.on('error', reject);
+    req.on('error', (err) => {
+      const responseTime = Date.now() - startTime;
+      cb.recordFailure(responseTime);
+      reject(err);
+    });
+
     req.on('timeout', () => {
+      const responseTime = Date.now() - startTime;
+      cb.recordFailure(responseTime);
       req.destroy(new Error('Request timeout'));
     });
 
@@ -65,6 +139,8 @@ export function makeRequest(
     new Promise<UpstreamResponse>((_, reject) => {
       const t = setTimeout(() => {
         clearTimeout(t);
+        const responseTime = Date.now() - startTime;
+        cb.recordFailure(responseTime);
         reject(new Error(`Request hard timeout after ${timeoutMs}ms`));
       }, timeoutMs + 200);
     }),
