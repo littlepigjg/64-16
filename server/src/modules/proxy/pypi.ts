@@ -1,80 +1,43 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { config } from '../../config';
-import { getMetadataIndex } from '../metadata';
 import { getCacheStorage } from '../cache';
-import type { PackageVersion } from '../../types';
+import { PypiFileLink, PypiPackageLink, tryUpstreamRequest, makeRequest } from './utils';
 import {
-  makeRequest,
-  UpstreamUnavailableError,
-  parsePypiSimpleIndex,
-  renderPypiSimpleIndex,
-  parsePypiPackageLinks,
-  renderPypiPackageLinks,
-  normalizePypiName,
-  pypiNamesMatch,
-  PypiFileLink,
-} from './utils';
+  getLocalSimpleIndex,
+  fetchUpstreamSimpleIndex,
+  mergeSimpleIndex,
+  sendSimpleIndex,
+  getLocalPackageFiles,
+  fetchUpstreamPackageFiles,
+  mergePackageFiles,
+  sendPackageLinks,
+  sendNotFoundHtml,
+  sendUpstreamErrorHtml,
+  sendUpstreamUnavailableError,
+  serveLocalFile,
+  serveAndCache,
+  findLocalPackage,
+} from './pypi-service';
 
 const pypiRouter = Router();
 
 pypiRouter.get('/simple/', async (_req: Request, res: Response, next: NextFunction) => {
   try {
-    const metadata = getMetadataIndex();
-    const { packages: localPackages } = metadata.listPackages({
-      registry: 'pypi',
-      limit: 100000,
-    });
+    const localSet = getLocalSimpleIndex();
 
-    const localSet = new Map<string, { name: string; private: boolean }>();
-    for (const p of localPackages) {
-      const norm = normalizePypiName(p.name);
-      if (!localSet.has(norm)) {
-        localSet.set(norm, { name: p.name, private: p.source === 'private' });
-      }
-    }
-
-    let upstreamPackages: ReturnType<typeof parsePypiSimpleIndex> = [];
+    let upstreamPackages: PypiPackageLink[] = [];
     let upstreamFailed = false;
 
     try {
-      const response = await makeRequest(`${config.pypi.simpleUpstream}/`, { timeout: 2000 });
-      if (response.statusCode === 200) {
-        upstreamPackages = parsePypiSimpleIndex(response.body.toString('utf-8'));
-      } else {
-        upstreamFailed = true;
-      }
-    } catch (err) {
-      if (err instanceof UpstreamUnavailableError) {
-        throw err;
-      }
+      const result = await fetchUpstreamSimpleIndex();
+      upstreamPackages = result.packages;
+      upstreamFailed = result.failed;
+    } catch (_err) {
       upstreamFailed = true;
     }
 
-    const merged = new Map<string, { name: string; href?: string; private?: boolean }>();
-
-    for (const up of upstreamPackages) {
-      const norm = normalizePypiName(up.name);
-      if (!merged.has(norm)) {
-        merged.set(norm, { name: up.name, href: up.href });
-      }
-    }
-
-    for (const [norm, info] of localSet) {
-      merged.set(norm, {
-        name: info.name,
-        href: `./${encodeURIComponent(info.name)}/`,
-        private: info.private,
-      });
-    }
-
-    const html = renderPypiSimpleIndex(Array.from(merged.values()));
-
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.setHeader('X-Local-Packages', localSet.size.toString());
-    if (upstreamFailed) {
-      res.setHeader('X-Upstream-Status', 'offline');
-    }
-    res.send(html);
+    const merged = mergeSimpleIndex(localSet, upstreamPackages);
+    sendSimpleIndex(res, merged, localSet.size, upstreamFailed);
   } catch (err) {
     next(err);
   }
@@ -83,90 +46,34 @@ pypiRouter.get('/simple/', async (_req: Request, res: Response, next: NextFuncti
 pypiRouter.get(/^\/simple\/(.+)\/$/, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const packageName = decodeURIComponent(req.params[0] as string);
-    const metadata = getMetadataIndex();
-    const cache = getCacheStorage();
 
-    const allLocal = metadata.listPackages({ registry: 'pypi', limit: 100000 }).packages;
-    const localPkg = allLocal.find((p) => pypiNamesMatch(p.name, packageName));
-
-    const localFiles: PypiFileLink[] = [];
-    if (localPkg && localPkg.versions.length > 0) {
-      for (const v of localPkg.versions as PackageVersion[]) {
-        const filename =
-          v.filePath.split('\\').pop()?.split('/').pop() ||
-          `${localPkg.name}-${v.version}.tar.gz`;
-        localFiles.push({
-          filename,
-          href: `/pypi/files/${encodeURIComponent(localPkg.name)}/${encodeURIComponent(v.version)}/${encodeURIComponent(filename)}${
-            v.sha1 ? `#sha256=${v.sha1}` : ''
-          }`,
-          hash: v.sha1,
-          size: v.size,
-        });
-      }
-    }
+    const localResult = getLocalPackageFiles(packageName);
 
     let upstreamFiles: PypiFileLink[] = [];
     let upstreamFailed = false;
+    let upstreamNotFound = false;
 
     try {
-      const response = await makeRequest(
-        `${config.pypi.simpleUpstream}/${encodeURIComponent(packageName)}/`,
-        { timeout: 3000 }
-      );
-      if (response.statusCode === 200) {
-        upstreamFiles = parsePypiPackageLinks(response.body.toString('utf-8'));
-      } else if (response.statusCode === 404 && localFiles.length === 0) {
-        res.status(404).send(
-          `<!DOCTYPE html><html><body><h1>Package not found</h1><p>No package named '${packageName}' in local cache or upstream.</p></body></html>`
-        );
-        return;
-      } else {
-        upstreamFailed = true;
-      }
-    } catch (err) {
-      if (err instanceof UpstreamUnavailableError) {
-        throw err;
-      }
+      const result = await fetchUpstreamPackageFiles(packageName);
+      upstreamFiles = result.files;
+      upstreamFailed = result.failed;
+      upstreamNotFound = result.notFound;
+    } catch (_err) {
       upstreamFailed = true;
-      if (localFiles.length === 0) {
-        res.status(502).send(
-          `<!DOCTYPE html><html><body><h1>Upstream error</h1><p>Cannot reach PyPI upstream and no local cache for '${packageName}'.</p></body></html>`
-        );
-        return;
-      }
     }
 
-    const seenFilenames = new Set<string>();
-    const mergedFiles: PypiFileLink[] = [];
-
-    for (const f of localFiles) {
-      const norm = f.filename.toLowerCase();
-      if (!seenFilenames.has(norm)) {
-        seenFilenames.add(norm);
-        mergedFiles.push(f);
-      }
+    if (upstreamNotFound && localResult.files.length === 0) {
+      sendNotFoundHtml(res, packageName);
+      return;
     }
 
-    for (const f of upstreamFiles) {
-      const norm = f.filename.toLowerCase();
-      if (!seenFilenames.has(norm)) {
-        seenFilenames.add(norm);
-        mergedFiles.push(f);
-      }
+    if (upstreamFailed && localResult.files.length === 0) {
+      sendUpstreamErrorHtml(res, packageName);
+      return;
     }
 
-    mergedFiles.sort((a, b) => a.filename.localeCompare(b.filename));
-
-    const displayName = localPkg?.name || packageName;
-    const html = renderPypiPackageLinks(displayName, mergedFiles);
-
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.setHeader('X-Local-Files', localFiles.length.toString());
-    if (upstreamFailed) {
-      res.setHeader('X-Upstream-Status', 'offline');
-    }
-    res.send(html);
+    const mergedFiles = mergePackageFiles(localResult.files, upstreamFiles);
+    sendPackageLinks(res, localResult.displayName, mergedFiles, localResult.files.length, upstreamFailed);
   } catch (err) {
     next(err);
   }
@@ -184,22 +91,20 @@ pypiRouter.get(
       const packageName = req.params.package as string;
       const version = req.params.version as string;
       const filename = req.params.filename as string;
-      const metadata = getMetadataIndex();
       const cache = getCacheStorage();
 
       const cachePath = cache.getPypiCachePath(packageName, version, filename);
 
       if (cache.fileExists(cachePath)) {
-        serveLocalFile(res, metadata, cache, packageName, version, cachePath);
+        serveLocalFile(res, packageName, version, cachePath);
         return;
       }
 
-      const allLocal = metadata.listPackages({ registry: 'pypi', limit: 100000 }).packages;
-      const matchedPkg = allLocal.find((p) => pypiNamesMatch(p.name, packageName));
+      const matchedPkg = findLocalPackage(packageName);
       if (matchedPkg && matchedPkg.name !== packageName) {
         const altCachePath = cache.getPypiCachePath(matchedPkg.name, version, filename);
         if (cache.fileExists(altCachePath)) {
-          serveLocalFile(res, metadata, cache, matchedPkg.name, version, altCachePath);
+          serveLocalFile(res, matchedPkg.name, version, altCachePath);
           return;
         }
       }
@@ -208,81 +113,58 @@ pypiRouter.get(
       const firstLetter = normalizedName[0]?.toLowerCase() || normalizedName[0];
       const upstreamUrl = `https://files.pythonhosted.org/packages/source/${firstLetter}/${normalizedName}/${filename}`;
 
-      const response = await makeRequest(upstreamUrl, { timeout: 30000 });
-      if (response.statusCode !== 200) {
-        const altUrl = `${config.pypi.upstream}/packages/source/${firstLetter}/${packageName}/${filename}`;
-        const altResponse = await makeRequest(altUrl, { timeout: 30000 });
-        if (altResponse.statusCode !== 200) {
-          res.status(404).json({ error: 'File not found' });
-          return;
-        }
-        serveAndCache(altResponse, matchedPkg?.name || packageName, version, filename, cachePath, res);
+      const primaryResult = await tryUpstreamRequest(upstreamUrl, { timeout: 30000 });
+      if (primaryResult.ok && primaryResult.response && primaryResult.response.statusCode === 200) {
+        serveAndCache(primaryResult.response, matchedPkg?.name || packageName, version, filename, cachePath, res);
         return;
       }
 
-      serveAndCache(response, matchedPkg?.name || packageName, version, filename, cachePath, res);
+      const altUrl = `${config.pypi.upstream}/packages/source/${firstLetter}/${packageName}/${filename}`;
+      const altResult = await tryUpstreamRequest(altUrl, { timeout: 30000 });
+      if (altResult.ok && altResult.response && altResult.response.statusCode === 200) {
+        serveAndCache(altResult.response, matchedPkg?.name || packageName, version, filename, cachePath, res);
+        return;
+      }
+
+      if (primaryResult.isCircuitBreakerOpen || altResult.isCircuitBreakerOpen) {
+        const upstreamName = primaryResult.upstreamName || altResult.upstreamName || 'pypi';
+        const retryAfter = 30;
+        sendUpstreamUnavailableError(res, filename, upstreamName, retryAfter);
+        return;
+      }
+
+      res.status(404).json({ error: 'File not found' });
     } catch (err) {
       next(err);
     }
   }
 );
 
-function serveLocalFile(
-  res: Response,
-  metadata: ReturnType<typeof getMetadataIndex>,
-  cache: ReturnType<typeof getCacheStorage>,
-  packageName: string,
-  version: string,
-  filePath: string
-): void {
-  const pkg = metadata.getPackage(packageName, 'pypi');
-  if (pkg) {
-    metadata.incrementVersionDownload(
-      metadata.getOrCreatePackage(packageName, 'pypi', pkg.source),
-      version
-    );
-  }
-  const fileSize = cache.getFileSize(filePath);
-  res.setHeader('Content-Length', fileSize.toString());
-  res.setHeader('Content-Type', 'application/octet-stream');
-  res.setHeader('X-Cache', 'HIT');
-  cache.readStream(filePath).pipe(res);
-}
-
-function serveAndCache(
-  response: { statusCode: number; headers: Record<string, string>; body: Buffer },
-  packageName: string,
-  version: string,
-  filename: string,
-  cachePath: string,
-  res: Response
-): void {
-  const metadata = getMetadataIndex();
-  const cache = getCacheStorage();
-
-  cache.writeFile(cachePath, response.body);
-  const pkgId = metadata.getOrCreatePackage(packageName, 'pypi', 'cache');
-  metadata.addVersion(pkgId, version, response.body.length, cachePath);
-  metadata.incrementVersionDownload(pkgId, version);
-
-  res.setHeader('Content-Length', response.body.length.toString());
-  res.setHeader('Content-Type', response.headers['content-type'] || 'application/octet-stream');
-  res.setHeader('X-Cache', 'MISS');
-  res.send(response.body);
-}
-
 pypiRouter.get('/pypi/:package/json', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const packageName = req.params.package as string;
-    const response = await makeRequest(`${config.pypi.upstream}/pypi/${encodeURIComponent(packageName)}/json`, {
-      timeout: 15000,
-    });
-    res.status(response.statusCode);
-    res.setHeader('Content-Type', response.headers['content-type'] || 'application/json');
-    res.send(response.body);
+    const result = await tryUpstreamRequest(
+      `${config.pypi.upstream}/pypi/${encodeURIComponent(packageName)}/json`,
+      { timeout: 15000 }
+    );
+
+    if (!result.ok || !result.response) {
+      if (result.isCircuitBreakerOpen) {
+        const upstreamName = result.upstreamName || 'pypi';
+        sendUpstreamUnavailableError(res, packageName, upstreamName, 30);
+        return;
+      }
+      res.status(502).json({ error: 'Upstream request failed' });
+      return;
+    }
+
+    res.status(result.response.statusCode);
+    res.setHeader('Content-Type', result.response.headers['content-type'] || 'application/json');
+    res.send(result.response.body);
   } catch (err) {
     next(err);
   }
 });
 
 export { pypiRouter };
+export type { PypiFileLink };

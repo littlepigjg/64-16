@@ -4,7 +4,17 @@ import { getMetadataIndex } from '../metadata';
 import { getCacheStorage } from '../cache';
 import { parseNpmPackageName, sanitizePath } from '../../utils';
 import { isPrivateScope } from '../private-pkg';
-import { makeRequest, UpstreamUnavailableError } from './utils';
+import { makeRequest, UpstreamUnavailableError, tryUpstreamRequest, parseNpmTarballFilename } from './utils';
+import {
+  getLocalNpmMetadata,
+  fetchUpstreamNpmMetadata,
+  fetchUpstreamNpmVersionMetadata,
+  fetchUpstreamNpmTarball,
+  sendNpmMetadata,
+  sendNpmVersionMetadata,
+  sendNpmUnavailableError,
+  cacheNpmMetadata,
+} from './npm-service';
 import type { PackageVersion } from '../../types';
 
 const npmRouter = Router();
@@ -115,8 +125,6 @@ npmRouter.put('/:package', async (req: Request, res: Response, next: NextFunctio
 });
 
 async function handleNpmMetadata(packageName: string, res: Response): Promise<void> {
-  const metadata = getMetadataIndex();
-  const cache = getCacheStorage();
   const { scope } = parseNpmPackageName(packageName);
 
   if (scope && isPrivateScope(scope)) {
@@ -124,38 +132,46 @@ async function handleNpmMetadata(packageName: string, res: Response): Promise<vo
     return;
   }
 
-  const response = await makeRequest(`${config.npm.upstream}/${encodeURIComponent(packageName)}`);
+  const localResult = getLocalNpmMetadata(packageName);
 
-  if (response.statusCode !== 200) {
-    res.status(response.statusCode);
-    res.send(response.body);
+  let upstreamOk = false;
+  let upstreamCircuitOpen = false;
+  let upstreamResponse: { statusCode: number; headers: Record<string, string>; body: Buffer } | undefined;
+
+  try {
+    const result = await fetchUpstreamNpmMetadata(packageName);
+    upstreamOk = result.ok;
+    upstreamCircuitOpen = result.circuitOpen;
+    upstreamResponse = result.response;
+  } catch (_err) {
+    upstreamOk = false;
+  }
+
+  if (upstreamOk && upstreamResponse && upstreamResponse.statusCode === 200) {
+    cacheNpmMetadata(packageName, upstreamResponse.body);
+    res.json(JSON.parse(upstreamResponse.body.toString()));
     return;
   }
 
-  const pkgData = JSON.parse(response.body.toString());
-  const versionEntries = Object.entries(pkgData.versions || {});
-
-  const pkgId = metadata.getOrCreatePackage(packageName, 'npm', 'cache', scope);
-  metadata.upsertPackageInfo({
-    name: packageName,
-    registry: 'npm',
-    description: pkgData.description,
-    author: typeof pkgData.author === 'string' ? pkgData.author : pkgData.author?.name,
-    license: typeof pkgData.license === 'string' ? pkgData.license : pkgData.license?.type,
-    latestVersion: pkgData['dist-tags']?.latest || '',
-    source: 'cache',
-    scope,
-  });
-
-  for (const [version, verData] of versionEntries) {
-    const dist = (verData as any).dist || {};
-    const tarballUrl: string = dist.tarball || '';
-    const filename = tarballUrl.split('/').pop() || `${sanitizePath(packageName)}-${version}.tgz`;
-    const cachePath = cache.getNpmCachePath(packageName, version, filename);
-    metadata.addVersion(pkgId, version, 0, cachePath, dist.shasum);
+  if (upstreamCircuitOpen && localResult.found && localResult.metadata) {
+    res.setHeader('X-Upstream-Status', 'offline');
+    res.setHeader('X-Cache', 'HIT');
+    sendNpmMetadata(res, localResult.metadata);
+    return;
   }
 
-  res.json(pkgData);
+  if (upstreamCircuitOpen && !localResult.found) {
+    sendNpmUnavailableError(res, packageName);
+    return;
+  }
+
+  if (upstreamResponse) {
+    res.status(upstreamResponse.statusCode);
+    res.send(upstreamResponse.body);
+    return;
+  }
+
+  res.status(502).json({ error: 'Upstream request failed' });
 }
 
 async function handleNpmTarball(packageName: string, filename: string, res: Response): Promise<void> {
@@ -168,8 +184,7 @@ async function handleNpmTarball(packageName: string, filename: string, res: Resp
     return;
   }
 
-  const versionMatch = filename.match(/-(\d+\.\d+[^-]*)\.tgz$/);
-  const version = versionMatch ? versionMatch[1] : '';
+  const { version } = parseNpmTarballFilename(filename);
   const cachePath = version ? cache.getNpmCachePath(packageName, version, filename) : '';
 
   if (cachePath && cache.fileExists(cachePath)) {
@@ -187,7 +202,19 @@ async function handleNpmTarball(packageName: string, filename: string, res: Resp
   }
 
   const upstreamUrl = `${config.npm.upstream}/${encodeURIComponent(packageName)}/-/${filename}`;
-  const response = await makeRequest(upstreamUrl);
+  const result = await tryUpstreamRequest(upstreamUrl);
+
+  if (!result.ok || !result.response) {
+    if (result.isCircuitBreakerOpen) {
+      const upstreamName = result.upstreamName || 'npm';
+      sendNpmUnavailableError(res, packageName, upstreamName);
+      return;
+    }
+    res.status(502).json({ error: 'Upstream request failed' });
+    return;
+  }
+
+  const response = result.response;
 
   if (response.statusCode !== 200) {
     res.status(response.statusCode);
@@ -216,10 +243,47 @@ async function handleNpmVersionMetadata(packageName: string, version: string, re
     return;
   }
 
-  const response = await makeRequest(`${config.npm.upstream}/${encodeURIComponent(packageName)}/${encodeURIComponent(version)}`);
-  res.status(response.statusCode);
-  res.setHeader('Content-Type', response.headers['content-type'] || 'application/json');
-  res.send(response.body);
+  const localResult = getLocalNpmMetadata(packageName);
+
+  let upstreamOk = false;
+  let upstreamCircuitOpen = false;
+  let upstreamResponse: { statusCode: number; headers: Record<string, string>; body: Buffer } | undefined;
+
+  try {
+    const result = await fetchUpstreamNpmVersionMetadata(packageName, version);
+    upstreamOk = result.ok;
+    upstreamCircuitOpen = result.circuitOpen;
+    upstreamResponse = result.response;
+  } catch (_err) {
+    upstreamOk = false;
+  }
+
+  if (upstreamOk && upstreamResponse) {
+    sendNpmVersionMetadata(res, upstreamResponse);
+    return;
+  }
+
+  if (upstreamCircuitOpen && localResult.found && localResult.metadata) {
+    const versionData = localResult.metadata.versions?.[version];
+    if (versionData) {
+      res.setHeader('X-Upstream-Status', 'offline');
+      res.setHeader('X-Cache', 'HIT');
+      res.json(versionData);
+      return;
+    }
+  }
+
+  if (upstreamCircuitOpen) {
+    sendNpmUnavailableError(res, packageName);
+    return;
+  }
+
+  if (upstreamResponse) {
+    sendNpmVersionMetadata(res, upstreamResponse);
+    return;
+  }
+
+  res.status(502).json({ error: 'Upstream request failed' });
 }
 
 async function handleNpmPublish(packageName: string, req: Request, res: Response): Promise<void> {

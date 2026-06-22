@@ -147,6 +147,42 @@ export function makeRequest(
   ]);
 }
 
+export interface UpstreamRequestResult {
+  ok: boolean;
+  response?: UpstreamResponse;
+  error?: Error;
+  isCircuitBreakerOpen: boolean;
+  upstreamName?: string;
+}
+
+export async function tryUpstreamRequest(
+  urlStr: string,
+  options: {
+    method?: string;
+    headers?: Record<string, string>;
+    body?: Buffer;
+    timeout?: number;
+  } = {}
+): Promise<UpstreamRequestResult> {
+  try {
+    const response = await makeRequest(urlStr, options);
+    return {
+      ok: true,
+      response,
+      isCircuitBreakerOpen: false,
+    };
+  } catch (err) {
+    const error = err as Error;
+    const isCB = error instanceof UpstreamUnavailableError;
+    return {
+      ok: false,
+      error,
+      isCircuitBreakerOpen: isCB,
+      upstreamName: isCB ? (error as UpstreamUnavailableError).upstreamName : undefined,
+    };
+  }
+}
+
 export interface PypiPackageLink {
   name: string;
   href: string;
@@ -282,4 +318,9 @@ export function normalizePypiName(name: string): string {
 
 export function pypiNamesMatch(a: string, b: string): boolean {
   return normalizePypiName(a) === normalizePypiName(b);
+}
+
+export function parseNpmTarballFilename(filename: string): { version: string } {
+  const versionMatch = filename.match(/-(\d+\.\d+[^-]*)\.tgz$/);
+  return { version: versionMatch ? versionMatch[1] : '' };
 }
