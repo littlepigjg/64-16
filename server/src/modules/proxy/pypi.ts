@@ -13,6 +13,8 @@ import {
   sendPackageLinks,
   sendNotFoundHtml,
   sendUpstreamErrorHtml,
+  sendUpstreamIndexErrorHtml,
+  sendUpstreamUnavailableIndexHtml,
   sendUpstreamUnavailableError,
   serveLocalFile,
   serveAndCache,
@@ -27,13 +29,24 @@ pypiRouter.get('/simple/', async (_req: Request, res: Response, next: NextFuncti
 
     let upstreamPackages: PypiPackageLink[] = [];
     let upstreamFailed = false;
+    let circuitOpen = false;
 
     try {
       const result = await fetchUpstreamSimpleIndex();
       upstreamPackages = result.packages;
       upstreamFailed = result.failed;
+      circuitOpen = result.circuitOpen;
     } catch (_err) {
       upstreamFailed = true;
+    }
+
+    if (upstreamFailed && localSet.size === 0) {
+      if (circuitOpen) {
+        sendUpstreamUnavailableIndexHtml(res, 30);
+      } else {
+        sendUpstreamIndexErrorHtml(res);
+      }
+      return;
     }
 
     const merged = mergeSimpleIndex(localSet, upstreamPackages);

@@ -215,6 +215,41 @@ export function sendUpstreamErrorHtml(res: Response, packageName: string): void 
   );
 }
 
+export function sendUpstreamIndexErrorHtml(res: Response): void {
+  res.status(502).send(
+    `<!DOCTYPE html>
+<html>
+  <head>
+    <title>Simple index - Upstream Error</title>
+  </head>
+  <body>
+    <h1>Upstream Error</h1>
+    <p>Cannot reach PyPI upstream and no local packages cached yet.</p>
+    <p>Please try again later.</p>
+  </body>
+</html>`
+  );
+}
+
+export function sendUpstreamUnavailableIndexHtml(res: Response, retryAfter: number = 30): void {
+  res.setHeader('Retry-After', retryAfter.toString());
+  res.setHeader('X-Upstream-Status', 'unavailable');
+  res.status(503).send(
+    `<!DOCTYPE html>
+<html>
+  <head>
+    <title>Simple index - Service Unavailable</title>
+  </head>
+  <body>
+    <h1>Service Unavailable</h1>
+    <p>PyPI upstream is currently unavailable due to repeated failures.</p>
+    <p>Circuit breaker is open to protect the system.</p>
+    <p>Please try again after ${retryAfter} seconds.</p>
+  </body>
+</html>`
+  );
+}
+
 export function serveLocalFile(
   res: Response,
   packageName: string,

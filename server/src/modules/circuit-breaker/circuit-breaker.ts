@@ -19,6 +19,7 @@ export class CircuitBreaker {
   private state: CircuitBreakerState = 'closed';
   private openUntil: number | null = null;
   private halfOpenRequests = 0;
+  private halfOpenSuccesses = 0;
   private slidingWindow: SlidingWindow;
   private rateLimiter: RateLimiter;
   private totalRequests = 0;
@@ -83,8 +84,8 @@ export class CircuitBreaker {
 
     if (this.state === 'half-open') {
       this.halfOpenRequests--;
-      const stats = this.slidingWindow.getStats();
-      if (stats.consecutiveFailures === 0 && stats.errorRate === 0) {
+      this.halfOpenSuccesses++;
+      if (this.halfOpenSuccesses >= this.config.halfOpenMaxRequests) {
         this.transitionToClosed();
       }
     }
@@ -106,9 +107,10 @@ export class CircuitBreaker {
 
     if (this.state === 'closed') {
       const stats = this.slidingWindow.getStats();
+      const minRequestsForErrorRate = this.config.failureThreshold;
       const shouldOpen =
         stats.consecutiveFailures >= this.config.failureThreshold ||
-        stats.errorRate > 0.5 ||
+        (stats.total >= minRequestsForErrorRate && stats.errorRate > 0.5) ||
         responseTime > this.config.responseTimeThreshold;
 
       if (shouldOpen) {
@@ -129,6 +131,8 @@ export class CircuitBreaker {
     this.state = 'half-open';
     this.openUntil = null;
     this.halfOpenRequests = 0;
+    this.halfOpenSuccesses = 0;
+    this.slidingWindow.reset();
     console.info(`[CircuitBreaker] '${this.name}' transitioned to HALF-OPEN state. Sending probe requests.`);
   }
 
